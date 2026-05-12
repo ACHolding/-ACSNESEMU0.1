@@ -1,53 +1,45 @@
 #!/usr/bin/env python3
 """
-AC's SNES emu — silhouette shell (hue logo) + **mewsnes** core.
+AC's SNES emu — silhouette shell (hue logo) with the **mewsnes0.1** core
+pre-baked into this single .py file.
+
+Pre-baked here means: the core class lives in this file (no external
+``snes_core`` / ``snes_core_pure`` / Cython build required).
+It does NOT mean a ROM is embedded — that is still **FILES=OFF / #nobake**:
+the only cart bytes on the bus come from **Load ROM…** at runtime.
 
 PR (copy for GitHub)
--------------------
-**Title:** AC's SNES emu — mewsnes shell, FILES=OFF
+--------------------
+**Title:** AC's SNES emu — mewsnes0.1 core baked in, FILES=OFF (#nobake)
 
 **Summary**
-- UI shells the **mewsnes** cart loader / stub CPU: imports compiled ``snes_core``
-  (Cython) when present, else ``snes_core_pure`` (Python).
-- **FILES=OFF:** no pre-baked ROMs in the tree, no auto-load, no disk writes from the
-  core. The only bytes on the bus are what you pick with **Load ROM…** (then kept
-  in RAM for **Reload**).
+- mewsnes0.1 cart loader / stub CPU is inlined into snesemu0.1.py.
+- Removes ``snes_core`` / ``snes_core_pure`` / ``setup_snes.py`` runtime deps.
+- No pre-baked ROM bytes in the tree; user picks ``.sfc`` / ``.smc`` via dialog.
 
 **Test plan**
-- ``python snesemu0.1.py`` → caption + header show **mewsnes**; viewport states FILES=OFF.
-- Load a ``.sfc`` / ``.smc`` → title/map/PC update; **Reload** re-ingests last bytes.
+- ``python snesemu0.1.py`` → caption + header show **mewsnes0.1 (baked)**.
+- Click **Load ROM…**, pick a ``.sfc`` / ``.smc`` → title / map / PC update.
+- **Reload** re-ingests the last picked bytes (kept in RAM only).
 
-**Build** (optional Cython speed-up, same folder):
-
-  pip install pygame cython setuptools
-  python setup_snes.py build_ext --inplace
-  python snesemu0.1.py"""
+Requirements
+------------
+  pip install pygame
+"""
 
 from __future__ import annotations
 
-import sys
 import math
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List
 
 try:
     import pygame
 except ImportError:
     print("Error: pip install pygame", file=sys.stderr)
     sys.exit(1)
-
-_CORE = None
-try:
-    from snes_core import SNESCore as _CythonCore
-
-    _CORE = "cython"
-except ImportError:
-    try:
-        from snes_core_pure import SNESCorePure as _CythonCore
-
-        _CORE = "python"
-    except ImportError as e:
-        print("Error: need snes_core (mewsnes build) or snes_core_pure.py", e, file=sys.stderr)
-        sys.exit(1)
 
 try:
     import tkinter as tk
@@ -57,11 +49,192 @@ try:
 except ImportError:
     _HAS_TK = False
 
-# Product / core branding (UI only — modules stay ``snes_core`` / ``snes_core_pure``).
-MEWSNES = "mewsnes"
-FILES_OFF = True  # no pre-baked ROMs; no core disk I/O
+# Product / core branding.
+MEWSNES_CORE = "mewsnes0.1"  # core baked into this file
+FILES_OFF = True             # no pre-baked ROMs; no core disk I/O
 
-# --- Silhouette palette ---
+
+# =====================================================================
+# mewsnes0.1 — cart loader + stub CPU (pre-baked into this .py file)
+# =====================================================================
+#
+# Scope (honest): LoROM / HiROM heuristic, 512-byte copier header strip,
+# header read (title, map, reset vector), simple ROM/WRAM address mapping,
+# and a tiny stub CPU (NOP / BRK / "unknown" trace). This is not a full
+# 65816 + PPU + APU; commercial games will *load and identify*, not run.
+
+def _ms_normalize_cart(data: bytes) -> bytes:
+    """Strip an optional 512-byte copier header (size == 512 mod 1024)."""
+    if len(data) >= 512 and len(data) % 1024 == 512:
+        return data[512:]
+    return data
+
+
+def _ms_score_title(rom: bytes, base: int) -> int:
+    if base + 21 > len(rom):
+        return -1
+    score = 0
+    for b in rom[base : base + 21]:
+        if 32 <= b < 127:
+            score += 2
+        elif b in (0, 0x20):
+            score += 1
+        else:
+            score -= 1
+    return score
+
+
+def _ms_detect_hirom(rom: bytes) -> bool:
+    """Compare candidate header blocks at $7FC0 (LoROM) vs $FFC0 (HiROM)."""
+    if len(rom) < 0x10000:
+        return False
+    lo = _ms_score_title(rom, 0x7FC0)
+    hi = _ms_score_title(rom, 0xFFC0)
+    if hi > lo + 2:
+        return True
+    if len(rom) >= 0xFFE0:
+        csum = rom[0xFFDC] | (rom[0xFFDD] << 8)
+        comp = rom[0xFFDE] | (rom[0xFFDF] << 8)
+        if (csum ^ comp) == 0xFFFF and 0 < csum < 0xFFFF:
+            return True
+    return False
+
+
+def _ms_reset_vector_offset(rom: bytes, hirom: bool) -> int:
+    n = len(rom)
+    if hirom:
+        off = n - 0x10000 + 0xFFFC
+    else:
+        off = n - 0x8000 + 0x7FFC
+    if off < 0 or off + 1 >= n:
+        return -1
+    return off
+
+
+def _ms_read_title(rom: bytes, hirom: bool) -> str:
+    base = 0xFFC0 if hirom else 0x7FC0
+    if len(rom) < base + 21:
+        return "?"
+    raw = rom[base : base + 21]
+    return raw.decode("latin-1", errors="replace").strip("\x00 ").strip() or "?"
+
+
+@dataclass
+class MewSNES01:
+    """Baked mewsnes0.1 core. FILES=OFF — caller passes bytes from a dialog."""
+
+    rom: bytes = b""
+    hirom: bool = False
+    wram: bytearray = field(default_factory=lambda: bytearray(0x20000))
+    pb: int = 0
+    pc: int = 0x8000
+    a: int = 0
+    x: int = 0
+    y: int = 0
+    sp: int = 0x1FF
+    db: int = 0
+    d: int = 0
+    p: int = 0x34
+    halted: bool = False
+    trace: List[str] = field(default_factory=list)
+    last_error: str = ""
+
+    name: str = MEWSNES_CORE
+
+    def _log(self, msg: str) -> None:
+        self.trace.append(msg)
+        if len(self.trace) > 24:
+            self.trace = self.trace[-24:]
+
+    def load_cart(self, data: bytes) -> str:
+        """Ingest user-picked cart bytes. Returns '' on success, else error text."""
+        self.last_error = ""
+        if not data or len(data) < 0x8000:
+            self.last_error = "ROM too small (<32 KiB)"
+            self.rom = b""
+            return self.last_error
+        self.rom = _ms_normalize_cart(bytes(data))
+        self.hirom = _ms_detect_hirom(self.rom)
+        self.wram = bytearray(0x20000)
+        self.halted = False
+        self.trace.clear()
+        off = _ms_reset_vector_offset(self.rom, self.hirom)
+        if off < 0:
+            self.last_error = "Could not locate reset vector"
+            return self.last_error
+        vec = self.rom[off] | (self.rom[off + 1] << 8)
+        self.pb = 0
+        self.pc = vec & 0xFFFF
+        title = _ms_read_title(self.rom, self.hirom)
+        self._log(f"[cart] size={len(self.rom)} {'HiROM' if self.hirom else 'LoROM'} title={title!r}")
+        self._log(f"[boot] reset vector $00:{vec:04X} (file off {off:#x})")
+        return ""
+
+    def cart_title(self) -> str:
+        return _ms_read_title(self.rom, self.hirom) if self.rom else "(no ROM)"
+
+    def _rom_offset(self, addr24: int) -> int:
+        bank = (addr24 >> 16) & 0xFF
+        addr = addr24 & 0xFFFF
+        n = len(self.rom)
+        if n == 0:
+            return -1
+        if self.hirom:
+            if addr >= 0x8000:
+                off = ((bank & 0x3F) << 16) | addr
+            else:
+                off = ((bank & 0x3F) << 16) | (addr + 0x8000)
+        else:
+            if addr >= 0x8000:
+                off = ((bank & 0x7F) << 15) | (addr & 0x7FFF)
+            else:
+                return -1
+        return off if 0 <= off < n else -1
+
+    def read8(self, addr24: int) -> int:
+        bank = (addr24 >> 16) & 0xFF
+        addr = addr24 & 0xFFFF
+        if bank in (0x7E, 0x7F):
+            woff = ((bank & 1) << 16) | addr
+            return self.wram[woff] if woff < len(self.wram) else 0
+        if bank == 0x00 or 0x80 <= bank <= 0xFF:
+            off = self._rom_offset(addr24)
+            return self.rom[off] if off >= 0 else 0
+        return 0
+
+    def boot(self) -> None:
+        if not self.rom:
+            return
+        off = _ms_reset_vector_offset(self.rom, self.hirom)
+        if off < 0:
+            return
+        vec = self.rom[off] | (self.rom[off + 1] << 8)
+        self.pb = 0
+        self.pc = vec & 0xFFFF
+        self.halted = False
+        self._log(f"[boot] PB=00 PC={self.pc:04X}")
+
+    def step(self) -> None:
+        """Single-byte stub advance. Honest about not running real code."""
+        if self.halted or not self.rom:
+            return
+        addr24 = (self.pb << 16) | self.pc
+        op = self.read8(addr24)
+        self.pc = (self.pc + 1) & 0xFFFF
+        if op == 0x00:
+            self.halted = True
+            self._log("[cpu] BRK / stub halt")
+            return
+        if op == 0xEA:
+            self._log("[cpu] NOP")
+            return
+        self._log(f"[cpu] stub op ${op:02X} @ ${addr24:06X} (full CPU not implemented)")
+
+
+# =====================================================================
+# Silhouette UI
+# =====================================================================
+
 COLOR_VOID = (6, 6, 8)
 COLOR_PANEL = (16, 16, 20)
 COLOR_PANEL_INNER = (10, 10, 12)
@@ -74,7 +247,6 @@ COLOR_BTN_HOVER = (32, 32, 38)
 
 
 def hsv_to_rgb(h: float, s: float, v: float) -> tuple[int, int, int]:
-    """h in [0,360), s and v in [0,1]."""
     h = (h % 360.0) / 60.0
     i = int(math.floor(h))
     f = h - i
@@ -97,7 +269,6 @@ def hsv_to_rgb(h: float, s: float, v: float) -> tuple[int, int, int]:
 
 
 def draw_hue_logo(surf, font_big, font_tag, rect, tick_ms: int) -> None:
-    """AC's SNES emu wordmark — per-glyph hue sweep + mewsnes core tag."""
     base_h = (tick_ms // 24) % 360
     lines = ["AC's", "SNES", "emu"]
     y = rect.y + 8
@@ -105,12 +276,11 @@ def draw_hue_logo(surf, font_big, font_tag, rect, tick_ms: int) -> None:
         x = rect.x + 12
         for ci, ch in enumerate(line):
             hue = (base_h + li * 28 + ci * 18) % 360
-            col = hsv_to_rgb(hue, 0.55, 0.95)
-            glyph = font_big.render(ch, True, col)
+            glyph = font_big.render(ch, True, hsv_to_rgb(hue, 0.55, 0.95))
             surf.blit(glyph, (x, y))
             x += glyph.get_width()
         y += font_big.get_height() - 2
-    tag = font_tag.render(f"{MEWSNES} core · FILES=OFF", True, COLOR_TEXT_DIM)
+    tag = font_tag.render(f"{MEWSNES_CORE} (baked) · FILES=OFF · #nobake", True, COLOR_TEXT_DIM)
     surf.blit(tag, (rect.x + 12, y + 4))
 
 
@@ -123,7 +293,7 @@ def draw_round_rect(surf, rect, radius, fill, border=None, bw=1):
 def draw_button(surf, font, label, rect, mouse_pos):
     hover = rect.collidepoint(mouse_pos)
     bg = COLOR_BTN_HOVER if hover else COLOR_PANEL
-    draw_round_rect(surf, rect, 6, bg, COLOR_EDGE if not hover else COLOR_EDGE_HI, 1)
+    draw_round_rect(surf, rect, 6, bg, COLOR_EDGE_HI if hover else COLOR_EDGE, 1)
     t = font.render(label, True, COLOR_TEXT if hover else COLOR_TEXT_DIM)
     surf.blit(t, (rect.centerx - t.get_width() // 2, rect.centery - t.get_height() // 2))
     return hover
@@ -131,8 +301,7 @@ def draw_button(surf, font, label, rect, mouse_pos):
 
 def main():
     pygame.init()
-    core_tag = f"{MEWSNES} · Cython" if _CORE == "cython" else f"{MEWSNES} · Python (fallback)"
-    pygame.display.set_caption(f"AC's SNES emu — {core_tag}")
+    pygame.display.set_caption(f"AC's SNES emu — {MEWSNES_CORE} (baked) · FILES=OFF")
 
     w, h = 760, 500
     screen = pygame.display.set_mode((w, h))
@@ -156,7 +325,7 @@ def main():
         font_body = pygame.font.Font(None, 17)
         font_small = pygame.font.Font(None, 15)
 
-    core = _CythonCore()
+    core = MewSNES01()
     root = None
     if _HAS_TK:
         root = tk.Tk()
@@ -199,7 +368,7 @@ def main():
                         pygame.event.pump()
                         path = filedialog.askopenfilename(
                             parent=root,
-                            title="AC's SNES emu — Open ROM",
+                            title=f"AC's SNES emu — {MEWSNES_CORE} — Open ROM",
                             filetypes=[
                                 ("SNES ROM", "*.sfc *.smc *.SFC *.SMC"),
                                 ("All", "*.*"),
@@ -217,9 +386,9 @@ def main():
                                     show_t(err, 120)
                                 else:
                                     last_cart = data
-                                    cap = f"AC's SNES emu — {MEWSNES} — {core.cart_title()[:40]}"
+                                    cap = f"AC's SNES emu — {MEWSNES_CORE} — {core.cart_title()[:36]}"
                                     pygame.display.set_caption(cap)
-                                    show_t(f"{MEWSNES}: cart ok · {len(data)} bytes · FILES=OFF", 90)
+                                    show_t(f"{MEWSNES_CORE}: cart ok · {len(data)} bytes · FILES=OFF #nobake", 90)
                 elif btn_step.collidepoint(event.pos):
                     core.step()
                     auto_run = False
@@ -247,7 +416,7 @@ def main():
 
         hdr = pygame.Rect(0, 0, w, header_h)
         draw_round_rect(screen, hdr, 0, COLOR_PANEL, COLOR_EDGE, 1)
-        mode = f"{MEWSNES} · Cython" if _CORE == "cython" else f"{MEWSNES} · pure Python"
+        mode = f"{MEWSNES_CORE} · baked-in"
         title = font_title.render(f"AC's SNES emu  ·  silhouette  ·  {mode}", True, COLOR_ACCENT)
         screen.blit(title, (margin, 10))
 
@@ -259,8 +428,8 @@ def main():
         draw_hue_logo(screen, font_logo, font_tag, logo_rect, tick)
         lines = [
             "",
-            f"FILES_OFF (no pre-baked ROM): {FILES_OFF}",
-            f"Core: {MEWSNES} (cart map + reset vector + stub CPU).",
+            f"FILES_OFF (pre-baked ROM = OFF): {FILES_OFF}  #nobake",
+            f"Core: {MEWSNES_CORE} — baked into this single .py file.",
             "No pre-baked ROM in this app — use Load ROM….",
             "Cartridge mapper: LoROM / HiROM (heuristic).",
             "512-byte copier header stripped if present.",
@@ -275,7 +444,7 @@ def main():
 
         draw_round_rect(screen, side, 10, COLOR_PANEL, COLOR_EDGE, 1)
         y = side.y + 10
-        title_s = core.cart_title() if hasattr(core, "cart_title") else "?"
+        title_s = core.cart_title()
         for lab in (
             "SNES header",
             f"  Title  {title_s[:34]}",
@@ -291,7 +460,7 @@ def main():
                 col = COLOR_TEXT
             screen.blit(font_body.render(lab, True, col), (side.x + 10, y))
             y += 20
-        for row in getattr(core, "trace", [])[-10:]:
+        for row in core.trace[-10:]:
             screen.blit(font_small.render(row, True, COLOR_TEXT_DIM), (side.x + 10, y))
             y += 16
 
